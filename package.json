@@ -15,7 +15,11 @@
     "commands": [
       {
         "command": "codeflux.helloWorld",
-        "title": "Hello World"
+        "title": "CodeFulx: Hello World"
+      },
+      {
+        "command": "codeflux.openVisualization",
+        "title": "CodeFlux: Open Visualization"
       }
     ]
   },
