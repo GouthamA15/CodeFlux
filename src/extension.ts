@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 let currentPanel: vscode.WebviewPanel | undefined = undefined;
+let isConnected = false;
 
 export function activate(context: vscode.ExtensionContext) {
 	console.log('Congratulations, your extension "codeflux" is now active!');
@@ -41,12 +42,70 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 	context.subscriptions.push(onDidChangeActiveDebugSession);
 
+	async function refreshRuntimeState() {
+		if (!currentPanel) return;
+		const session = vscode.debug.activeDebugSession;
+		if (!session) {
+			currentPanel.webview.postMessage({ command: 'updateRuntimeState', error: 'No active debug session.' });
+			return;
+		}
+
+		try {
+			// Request threads
+			const threadsResponse = await session.customRequest('threads');
+			const threads = threadsResponse.threads;
+			if (!threads || threads.length === 0) {
+				currentPanel.webview.postMessage({ command: 'updateRuntimeState', error: 'No threads available. Debugger might not be paused.' });
+				return;
+			}
+			const threadId = threads[0].id;
+			
+			// Request stackTrace
+			const stackTraceResponse = await session.customRequest('stackTrace', { threadId: threadId, levels: 1 });
+			const frames = stackTraceResponse.stackFrames;
+			if (!frames || frames.length === 0) {
+				currentPanel.webview.postMessage({ command: 'updateRuntimeState', error: 'No stack frames available.' });
+				return;
+			}
+			const frame = frames[0];
+			
+			// Request scopes
+			const scopesResponse = await session.customRequest('scopes', { frameId: frame.id });
+			const scopes = scopesResponse.scopes;
+			if (!scopes || scopes.length === 0) {
+				currentPanel.webview.postMessage({ command: 'updateRuntimeState', frameName: frame.name, variables: [] });
+				return;
+			}
+			
+			// Find local scope
+			const localScope = scopes.find((s: any) => s.name === 'Local' || s.name === 'Locals' || s.presentationHint === 'locals') || scopes[0];
+			
+			// Request variables
+			const variablesResponse = await session.customRequest('variables', { variablesReference: localScope.variablesReference });
+			const variables = variablesResponse.variables;
+			
+			currentPanel.webview.postMessage({
+				command: 'updateRuntimeState',
+				frameName: frame.name,
+				variables: variables.map((v: any) => ({ name: v.name, value: v.value }))
+			});
+		} catch (error: any) {
+			currentPanel.webview.postMessage({ 
+				command: 'updateRuntimeState', 
+				error: `Failed to retrieve runtime state. The debugger might be running (not paused) or does not support this operation. Error: ${error.message}` 
+			});
+		}
+	}
+
 	const openVisualizationCommand = vscode.commands.registerCommand('codeflux.openVisualization', () => {
 		if (currentPanel) {
 			// If we already have a panel, show it.
 			currentPanel.reveal(vscode.ViewColumn.One);
 			// Update status in case it changed while panel was hidden
 			updateWebviewDebugStatus();
+			if (isConnected) {
+				currentPanel.webview.postMessage({ command: 'connectionSuccess' });
+			}
 		} else {
 			// Otherwise, create a new panel.
 			currentPanel = vscode.window.createWebviewPanel(
@@ -57,7 +116,9 @@ export function activate(context: vscode.ExtensionContext) {
 					// Enable javascript in the webview
 					enableScripts: true,
 					// Restrict the webview to only loading content from our extension's `media` directory (none for now)
-					localResourceRoots: []
+					localResourceRoots: [],
+					// Retain context when hidden so the webview doesn't unmount when switched away
+					retainContextWhenHidden: true
 				}
 			);
 
@@ -69,10 +130,22 @@ export function activate(context: vscode.ExtensionContext) {
 				message => {
 					switch (message.command) {
 						case 'testConnection':
+							isConnected = true;
 							currentPanel?.webview.postMessage({ command: 'connectionSuccess' });
 							return;
 						case 'getInitialState':
+							// When webview loads/reloads, reply with current connection and debug state
+							if (isConnected) {
+								currentPanel?.webview.postMessage({ command: 'connectionSuccess' });
+							} else {
+								// By default the extension is active, so we can just mark it connected upon initial request
+								isConnected = true;
+								currentPanel?.webview.postMessage({ command: 'connectionSuccess' });
+							}
 							updateWebviewDebugStatus();
+							return;
+						case 'refreshRuntimeState':
+							refreshRuntimeState();
 							return;
 					}
 				},
@@ -84,6 +157,8 @@ export function activate(context: vscode.ExtensionContext) {
 			currentPanel.onDidDispose(
 				() => {
 					currentPanel = undefined;
+					// We do not reset isConnected here because the extension is still running,
+					// but since the panel is gone, it will be recreated next time.
 				},
 				null,
 				context.subscriptions
@@ -103,7 +178,7 @@ function getWebviewContent() {
     <title>CodeFlux Visualization</title>
     <style>
         body { font-family: sans-serif; padding: 20px; }
-        h1, h2, h3 { color: var(--vscode-editor-foreground); }
+        h1, h2, h3, h4 { color: var(--vscode-editor-foreground); }
         #status, #debugStatus { font-weight: bold; color: var(--vscode-notificationsWarningIcon-foreground); }
         .connected { color: var(--vscode-notificationsInfoIcon-foreground) !important; }
         button {
@@ -115,7 +190,7 @@ function getWebviewContent() {
             cursor: pointer;
         }
         button:hover { background-color: var(--vscode-button-hoverBackground); }
-        .debug-container {
+        .debug-container, .runtime-container {
             margin-top: 30px;
             padding: 15px;
             border: 1px solid var(--vscode-panel-border);
@@ -138,6 +213,14 @@ function getWebviewContent() {
         </div>
     </div>
 
+    <div class="runtime-container">
+        <h3>Runtime State</h3>
+        <button id="refreshRuntimeBtn">Refresh Runtime State</button>
+        <div id="runtimeContent" style="margin-top: 15px;">
+            <em>Click refresh while the debugger is paused...</em>
+        </div>
+    </div>
+
     <script>
         const vscode = acquireVsCodeApi();
         
@@ -146,6 +229,11 @@ function getWebviewContent() {
         
         document.getElementById('testBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'testConnection' });
+        });
+
+        document.getElementById('refreshRuntimeBtn').addEventListener('click', () => {
+            document.getElementById('runtimeContent').innerHTML = '<em>Refreshing...</em>';
+            vscode.postMessage({ command: 'refreshRuntimeState' });
         });
 
         window.addEventListener('message', event => {
@@ -170,6 +258,27 @@ function getWebviewContent() {
                     debugStatusEl.innerText = 'No Active Session';
                     debugStatusEl.className = '';
                     debugDetailsEl.style.display = 'none';
+                    // Clear runtime state when debug session ends
+                    document.getElementById('runtimeContent').innerHTML = '<em>Click refresh while the debugger is paused...</em>';
+                }
+            } else if (message.command === 'updateRuntimeState') {
+                const runtimeContentEl = document.getElementById('runtimeContent');
+                if (message.error) {
+                    runtimeContentEl.innerHTML = \`<span style="color: var(--vscode-errorForeground);">\${message.error}</span>\`;
+                } else {
+                    let html = \`<p>Paused: Yes</p>\`;
+                    html += \`<p>Current Frame: <strong>\${message.frameName}</strong></p>\`;
+                    html += \`<h4>Local Variables</h4>\`;
+                    if (message.variables && message.variables.length > 0) {
+                        html += \`<ul style="list-style-type: none; padding-left: 0;">\`;
+                        for (const v of message.variables) {
+                            html += \`<li><code>\${v.name} = \${v.value}</code></li>\`;
+                        }
+                        html += \`</ul>\`;
+                    } else {
+                        html += \`<p>No local variables.</p>\`;
+                    }
+                    runtimeContentEl.innerHTML = html;
                 }
             }
         });
